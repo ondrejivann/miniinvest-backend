@@ -8,7 +8,7 @@ This document describes the **target architecture of the demo**. Parts that are 
 
 | In scope | Out of scope (for now) |
 |---|---|
-| Buying an ETF with a market order by quantity | Selling, limit orders, cancelling orders |
+| Buying an ETF with a market order by quantity, including fractional quantities | Selling, limit orders, cancelling orders, buying for an amount of money |
 | Portfolio and order status | Fees, taxes, FX conversion |
 | Push notification about the result | Real exchange or broker connection |
 | One market (CZ, CZK); the contract is designed for several markets from day one (see section 6) | A second market in the demo (stretch goal, demo scenario 5) |
@@ -110,21 +110,27 @@ Authorization: Bearer <JWT>
 Idempotency-Key: 6f1c2a9e-1d0b-4b8e-9a51-3c2f0f1e7a42
 Content-Type: application/json
 
-{ "isin": "IE00B4L5Y983", "side": "BUY", "quantity": 5 }
+{ "isin": "IE00B4L5Y983", "side": "BUY", "quantity": "2.5" }
 ```
 
-The body carries only what the user decided: what and how much. The account comes from the token, the market and currency from the account, and the price from the server's own source, never from the client.
+The body carries only what the user decided: what and how much. The account comes from the token, the market and currency from the account, and the price from the server's own source, never from the client. The quantity is a decimal string, like money, so fractional shares need no special format.
 
 **S2. Routing.** DNS and TLS, then the load balancer sends the request to any invest-core instance. Any instance can handle it because no state lives in instance memory.
 
-**S3. Authentication and validation.** Spring Security verifies the JWT signature and expiry against Keycloak's public keys before the controller is reached (401 if invalid). Then Jackson maps the body and Bean Validation checks it: positive quantity and an instrument offered in the user's market (400 with `application/problem+json` if not).
+**S3. Authentication and validation.** Spring Security verifies the JWT signature and expiry against Keycloak's public keys before the controller is reached (401 if invalid). Then Jackson maps the body and Bean Validation checks its shape: a valid ISIN, a known side and a positive decimal quantity (400 with `application/problem+json` and code `VALIDATION_FAILED` if not).
 
 **S4. Idempotency check.** invest-core looks up `(user, Idempotency-Key)`.
 - Found with the same request body: return the stored response, do nothing else.
-- Found with a different body: 422.
+- Found with a different body: 422 with code `IDEMPOTENCY_KEY_REUSED`.
 - Not found: continue. Two identical requests arriving at the same moment are caught by the unique constraint in S6.
 
-**S5. Price.** Read the price from Redis. On a cache miss call market-service with a short timeout and store the result with a TTL of a few seconds. If market-service does not answer, reject with 503 and `Retry-After`. The reserved amount is an estimate, `price × quantity` plus a configurable buffer, because the execution price will differ.
+The body fingerprint is computed from the parsed request with the quantity normalized, so `"5"` and `"5.0"` are the same request.
+
+**S5. Business checks and price.** The checks run after the idempotency check, so a retry of an accepted order always gets its stored response, even if the offer changed in between.
+- The instrument must be offered in the user's market, otherwise 422 with code `INSTRUMENT_NOT_AVAILABLE`.
+- The quantity must be at least the instrument's `minQuantity` and a multiple of its `quantityStep`, otherwise 422 with code `QUANTITY_NOT_ALLOWED`. An instrument with step `1` allows whole units only, so fractional shares can be enabled per instrument or market without a contract change.
+
+Then read the price from Redis. On a cache miss call market-service with a short timeout and store the result with a TTL of a few seconds. If market-service does not answer, reject with 503, code `PRICE_UNAVAILABLE` and `Retry-After`. The reserved amount is an estimate, `price × quantity` plus a configurable buffer, rounded up to the decimal places of the currency, because the execution price will differ.
 
 **S6. One database transaction.**
 1. Reserve cash with a conditional update, so two concurrent purchases cannot spend the same money:
@@ -136,13 +142,20 @@ The body carries only what the user decided: what and how much. The account come
 
 Either all four rows exist after commit, or none.
 
-**S7. Response.** `202 Accepted` with `Location: /api/v1/orders/{id}`. The app shows "waiting for execution".
+**S7. Response.** `202 Accepted` with `Location: /api/v1/orders/{id}` and the order in the same shape as `GET /api/v1/orders/{id}` returns it. The app shows "waiting for execution".
 
 ```json
 {
   "orderId": "d3b07384-9a1f-4c1e-8f7a-2b4c6e8d0a11",
+  "side": "BUY",
+  "isin": "IE00B4L5Y983",
+  "quantity": "2.5",
   "status": "PENDING",
-  "reservedAmount": { "amount": "2650.00", "currency": "CZK" }
+  "reservedAmount": { "amount": "1330.00", "currency": "CZK" },
+  "executionPrice": null,
+  "rejectionCode": null,
+  "createdAt": "2026-10-31T22:27:00Z",
+  "updatedAt": "2026-10-31T22:27:00Z"
 }
 ```
 
@@ -172,9 +185,10 @@ Order states: `PENDING → EXECUTED` or `PENDING → REJECTED`.
 | S1 | Sync, HTTP | Double tap or retry sends two identical requests at once | Unique constraint on `(user, key)`; the second request gets the same response, or 409 while the first is still in progress | 1, 7 |
 | S2 | Sync | An instance dies mid-request | Health checks take it out of rotation; the client retries safely thanks to idempotency | 14 |
 | S3 | Sync | Token invalid or expired | 401, the app refreshes the token | 10 |
-| S3 | Sync | Invalid body | 400 with problem details, nothing stored | 1 |
+| S3 | Sync | Invalid body | 400 with problem details and code `VALIDATION_FAILED`, nothing stored | 1 |
+| S5 | Sync | Instrument not offered in the user's market, or quantity below the minimum or off the step | 422 with code `INSTRUMENT_NOT_AVAILABLE` or `QUANTITY_NOT_ALLOWED`, nothing stored | 1 |
 | S5 | Sync, cache | Redis is down | Fall back to market-service; Redis is only a cache | 9 |
-| S5 | Sync, HTTP | market-service slow or down | Timeout and circuit breaker; 503 with Retry-After; never wait without a limit | 4, 13 |
+| S5 | Sync, HTTP | market-service slow or down | Timeout and circuit breaker; 503 with code `PRICE_UNAVAILABLE` and Retry-After; never wait without a limit | 4, 13 |
 | S6 | Sync, DB | Insufficient funds | Conditional update changes 0 rows, rollback, 422 with code `INSUFFICIENT_FUNDS` | 6, 7 |
 | S6 | Sync, DB | Database down or commit fails | Nothing is stored (atomic), 503, client retries with the same key | 7 |
 | S6→S7 | Sync | invest-core crashes after commit, before responding | Client times out and retries; the idempotency record returns the original 202 | 1, 7 |
@@ -192,14 +206,14 @@ Order states: `PENDING → EXECUTED` or `PENDING → REJECTED`.
 
 ## 5. Data model of invest-core
 
-Money is stored as `NUMERIC` with an explicit currency, never as floating point.
+Money is stored as `NUMERIC` with an explicit currency, never as floating point. Quantities are `NUMERIC` too, because fractional shares are allowed.
 
 | Table | Key columns | Notes |
 |---|---|---|
 | `account` | `id`, `owner_id`, `market`, `currency`, `balance`, `reserved` | Available cash = `balance − reserved`; market and currency are fixed for the account |
-| `orders` | `id`, `account_id`, `isin`, `side`, `quantity`, `currency`, `status`, `reserved_amount`, `execution_price` | Status: PENDING, EXECUTED, REJECTED; amounts in `currency` |
-| `position` | `account_id`, `isin`, `quantity`, `average_price` | One row per instrument; price in the account currency |
-| `idempotency_key` | `owner_id`, `key`, `request_hash`, `response`, `created_at` | Unique on `(owner_id, key)`, cleaned up after a few days |
+| `orders` | `id`, `account_id`, `isin`, `side`, `quantity`, `currency`, `status`, `reserved_amount`, `execution_price` | Status: PENDING, EXECUTED, REJECTED; amounts in `currency`; `quantity` may be fractional |
+| `position` | `account_id`, `isin`, `quantity`, `average_price` | One row per instrument; price in the account currency; `quantity` may be fractional |
+| `idempotency_key` | `owner_id`, `key`, `request_hash`, `response`, `created_at` | Unique on `(owner_id, key)`, cleaned up after 72 hours |
 | `outbox` | `id`, `type`, `payload`, `traceparent`, `created_at`, `sent_at` | Read by the relay |
 | `processed_events` | `event_id`, `processed_at` | Consumer deduplication |
 
@@ -210,11 +224,14 @@ Money is stored as `NUMERIC` with an explicit currency, never as floating point.
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/v1/orders` | Place an order (needs `Idempotency-Key`) |
+| `GET /api/v1/orders` | Order history, newest first, with cursor pagination |
 | `GET /api/v1/orders/{id}` | Order status |
 | `GET /api/v1/portfolio` | Cash and positions |
-| `GET /api/v1/instruments` | Instruments offered in the user's market, with prices |
+| `GET /api/v1/instruments` | Instruments offered in the user's market, with prices, minimum quantity and quantity step |
 
-**REST (market-service, internal)**: `GET /api/v1/instruments?market=CZ` and `GET /api/v1/instruments/{isin}/price`. Only invest-core calls it; the app never talks to market-service directly.
+The full contract is in [`contracts/invest-core/openapi.yaml`](../contracts/invest-core/openapi.yaml) (OpenAPI 3.1).
+
+**REST (market-service, internal)**: `GET /api/v1/instruments?market=CZ` (the offer of a market, including `minQuantity` and `quantityStep` of each instrument) and `GET /api/v1/instruments/{isin}/price`. Only invest-core calls it; the app never talks to market-service directly.
 
 **Kafka**
 
@@ -224,7 +241,7 @@ Money is stored as `NUMERIC` with an explicit currency, never as floating point.
 | `orders.events` | `OrderExecuted`, `OrderRejected` | account ID |
 | `orders.events.dlt` | events that could not be processed | account ID |
 
-Every message carries `eventId`, `type`, `orderId`, `occurredAt` and the `traceparent` header. Money fields use the same `{ amount, currency }` format as the REST API.
+Every message carries `eventId`, `type`, `orderId`, `occurredAt` and the `traceparent` header. Money fields use the same `{ amount, currency }` format as the REST API, and quantities the same decimal string.
 
 ### Designed for several markets
 
@@ -233,12 +250,13 @@ The app stays in users' phones for months and old versions cannot be forced to u
 | Rule | Example | Why |
 |---|---|---|
 | Money always carries its currency; the amount is a decimal string | `{ "amount": "1234.50", "currency": "CZK" }` | No implicit default currency, no floating-point rounding |
+| Quantity is a decimal string; each instrument states its minimum and step | `"quantity": "2.5"`, `"quantityStep": "0.0001"` | Fractional shares can be enabled per market or instrument as data; a step of `1` means whole units only |
 | The market is a property of the account, never a request parameter | The server resolves CZ or SK from the user's account | The client must not decide where it trades, same as with the account ID or the price |
 | The instrument catalogue is filtered by the user's market | `GET /api/v1/instruments` returns a different offer for CZ and SK | The app has no hardcoded list of products |
 | Errors carry a stable machine-readable code | `application/problem+json` with `"code": "INSUFFICIENT_FUNDS"` | The app maps codes to texts in the user's language |
 | Enums are open for extension | An unknown order status is shown as "processing" | A new value on the server does not break old app versions (demo scenario 6) |
 
-Adding a market is server-side data and configuration: the market and its currency, its instrument offer and its rules. The detailed design is done in module 1.
+Adding a market is server-side data and configuration: the market and its currency, its instrument offer and its rules, including whether fractional shares are allowed.
 
 ## 7. Demo
 
@@ -296,3 +314,5 @@ Until then the design already accounts for it: stateless services, the unique co
 | Reserve an estimate with a buffer | Market order price is unknown when the order is placed | The difference is settled after execution |
 | Redis only for prices, never for balances | Stale data is acceptable for a price quote, not for money | Price can be a few seconds old |
 | Market from the account, currency in every amount | A new market needs no contract change and no new app version | Every amount must carry its currency; there is no implicit default |
+| Quantity as a decimal string with a per-instrument minimum and step | Fractional shares are common in investment apps; changing a number to a string later would break old app versions | Clients parse quantities as decimals; reservation and settlement need explicit rounding rules |
+| Business checks return 422, shape validation 400 | The app can tell "fix the request" from "the request is fine but not allowed" | The split must be kept consistently across the API |
