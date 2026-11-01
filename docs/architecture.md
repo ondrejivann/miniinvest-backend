@@ -229,7 +229,7 @@ Money is stored as `NUMERIC` with an explicit currency, never as floating point.
 | `GET /api/v1/portfolio` | Cash and positions |
 | `GET /api/v1/instruments` | Instruments offered in the user's market, with prices, minimum quantity and quantity step |
 
-The full contract is in [`contracts/invest-core/openapi.yaml`](../contracts/invest-core/openapi.yaml) (OpenAPI 3.1).
+The full contract is in [`contracts/invest-core/openapi.yaml`](../contracts/invest-core/openapi.yaml) (OpenAPI 3.1). The rules every endpoint follows are in [`api-guidelines.md`](api-guidelines.md).
 
 **REST (market-service, internal)**: `GET /api/v1/instruments?market=CZ` (the offer of a market, including `minQuantity` and `quantityStep` of each instrument) and `GET /api/v1/instruments/{isin}/price`. Only invest-core calls it; the app never talks to market-service directly.
 
@@ -314,5 +314,5 @@ Until then the design already accounts for it: stateless services, the unique co
 | Reserve an estimate with a buffer | Market order price is unknown when the order is placed | The difference is settled after execution |
 | Redis only for prices, never for balances | Stale data is acceptable for a price quote, not for money | Price can be a few seconds old |
 | Market from the account, currency in every amount | A new market needs no contract change and no new app version | Every amount must carry its currency; there is no implicit default |
-| Quantity as a decimal string with a per-instrument minimum and step | Fractional shares are common in investment apps; changing a number to a string later would break old app versions | Clients parse quantities as decimals; reservation and settlement need explicit rounding rules |
+| Quantity as a decimal string with a per-instrument minimum and step ([ADR 0001](adr/0001-order-quantity-format.md)) | Fractional shares are common in investment apps; changing a number to a string later would break old app versions | Clients parse quantities as decimals; reservation and settlement need explicit rounding rules |
 | Business checks return 422, shape validation 400 | The app can tell "fix the request" from "the request is fine but not allowed" | The split must be kept consistently across the API |
