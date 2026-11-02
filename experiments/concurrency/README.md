@@ -10,7 +10,9 @@ In step S5 of the buy flow (`docs/architecture.md`), invest-core calls market-se
 
 ## Setup
 
-- JDK 25 (the repository's `.sdkmanrc`), Kotlin, `kotlinx-coroutines-core`, Gradle with the Kotlin DSL and the `application` plugin.
+- Kotlin 2.4.21, `kotlinx-coroutines-core` 1.11.0 and Gradle 9.1 to 9.7 with the Kotlin DSL and the `application` plugin. Gradle 9.1 is the first version that runs on Java 25, and 9.7 is the newest one that Kotlin Gradle plugin 2.4.21 is tested with.
+- Gradle runs on JDK 25 (the repository's `.sdkmanrc`), but the code is compiled for Java 21 with `kotlin { jvmToolchain(21) }`, so the same build runs on JDK 21 and on JDK 25 (see Pinning). Gradle finds a JDK 21 installed with SDKMAN on its own.
+- Run the measurements with the start script that `./gradlew installDist` creates. It uses the JDK in `JAVA_HOME` and takes JVM options from `JAVA_OPTS`.
 - `SimulatedMarketClient.price(isin)` blocks the calling thread for a configurable latency with `Thread.sleep`. It stands for a blocking HTTP or JDBC call. Do not use `delay` here: the point of the experiment is a blocking call.
 - Command-line parameters: variant, number of calls (default 10 000) and latency (default 100 ms).
 
@@ -48,9 +50,16 @@ Before running anything, write the predicted wall time of every variant into `RE
 Run `virtual-synchronized` on JDK 21 and on JDK 25 with a Flight Recorder recording and count the pinning events:
 
 ```bash
-java -XX:StartFlightRecording=filename=pinning.jfr -jar <the experiment jar> virtual-synchronized
-jfr print --events jdk.VirtualThreadPinned pinning.jfr
+./gradlew installDist
+JAVA_HOME=$(sdk home java <JDK 21 version>) JAVA_OPTS="-XX:StartFlightRecording=filename=pinning-21.jfr" \
+  build/install/concurrency/bin/concurrency virtual-synchronized 1000
+JAVA_HOME=$(sdk home java <JDK 25 version>) JAVA_OPTS="-XX:StartFlightRecording=filename=pinning-25.jfr" \
+  build/install/concurrency/bin/concurrency virtual-synchronized 1000
+jfr summary pinning-21.jfr
+jfr print --events jdk.VirtualThreadPinned pinning-21.jfr
 ```
+
+`jfr summary` prints the number of events per type, and `jfr print` adds the stack of each event. The paths assume `rootProject.name = "concurrency"` in `settings.gradle.kts`.
 
 On JDK 21 a virtual thread that blocks inside `synchronized` pins its carrier thread, so the run is limited by the number of carriers. JDK 24 removed this with JEP 491. Record the wall time and the number of events for both JDKs.
 
